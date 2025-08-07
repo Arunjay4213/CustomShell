@@ -1,0 +1,7 @@
+# Ignore the local-only directory
+local_configs/
+
+# Other things to ignore
+__pycache__/
+.idea/
+*.pyc
