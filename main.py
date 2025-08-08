@@ -6,6 +6,7 @@ import platform
 
 BUILTINS = {"cd", "pwd", "clear", "exit", "help"}
 
+
 def is_builtin_command(command):
     if command.strip() == "":
         return False
@@ -14,6 +15,7 @@ def is_builtin_command(command):
         return cmd_name in BUILTINS
     except IndexError:
         return False
+
 
 def handle_help():
     help_text = """
@@ -32,23 +34,21 @@ External Commands:
 """
     print(help_text)
 
+
 def handle_pwd():
     print(os.getcwd())
-    
+
+
 def handle_clear():
     if platform.system() == "Windows":
         os.system("cls")
     else:
         os.system("clear")
 
+
 def handle_cd(args):
     try:
-        # Default to home directory if no path is given
-        if len(args) < 2:
-            path = os.path.expanduser("~")
-        else:
-            path = args[1]
-
+        path = os.path.expanduser("~") if len(args) < 2 else args[1]
         os.chdir(path)
     except FileNotFoundError:
         print(f"cd: no such file or directory: {path}")
@@ -59,10 +59,11 @@ def handle_cd(args):
     except Exception as e:
         print(f"cd: error: {e}")
 
+
 def handle_builtin_command(command):
     args = shlex.split(command)
     cmd_name = args[0]
-    if (cmd_name == "cd"):
+    if cmd_name == "cd":
         return handle_cd(args)
     elif cmd_name == "pwd":
         return handle_pwd()
@@ -74,46 +75,79 @@ def handle_builtin_command(command):
         return "exit"
 
 
+def parse_redirection(tokens):
+    command_tokens = []
+    stdin_file = None
+    stdout_file = None
+    append_mode = False
+
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token == "<" and i + 1 < len(tokens):
+            stdin_file = tokens[i + 1]
+            i += 2
+        elif token == ">" and i + 1 < len(tokens):
+            stdout_file = tokens[i + 1]
+            append_mode = False
+            i += 2
+        elif token == ">>" and i + 1 < len(tokens):
+            stdout_file = tokens[i + 1]
+            append_mode = True
+            i += 2
+        else:
+            command_tokens.append(token)
+            i += 1
+
+    return command_tokens, stdin_file, stdout_file, append_mode
+
+
 def run_external_command(command):
-    if command == "":
+    if command.strip() == "":
         return
-    if command == "exit":
-        return "exit"
     if is_builtin_command(command):
         return handle_builtin_command(command)
 
+    tokens = shlex.split(command)
+    cmd_tokens, stdin_file, stdout_file, append_mode = parse_redirection(tokens)
 
-    use_shell = platform.system() == "Windows"
-
+    stdin = None
+    stdout = None
     try:
-        if use_shell:
-            # On Windows, use shell=True and pass raw command
-            subprocess.run(command, shell=True)
-        else:
-            # On Unix, split command and pass as list
-            args = shlex.split(command)
-            subprocess.run(args)
+        if stdin_file:
+            stdin = open(stdin_file, "r")
+        if stdout_file:
+            mode = "a" if append_mode else "w"
+            stdout = open(stdout_file, mode)
+
+        subprocess.run(cmd_tokens, stdin=stdin, stdout=stdout, shell=(platform.system() == "Windows"))
     except FileNotFoundError:
-        print("Command not found")
+        print("Command or file not found")
     except PermissionError:
-        print("You do not have permission to run this")
+        print("Permission denied")
     except KeyboardInterrupt:
-        print()  # Move to next line without crashing
+        print()
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
+    finally:
+        if stdin:
+            stdin.close()
+        if stdout:
+            stdout.close()
 
 
 def shell_loop():
     while True:
-        cwd = os.getcwd()
-        sys.stdout.write(f"{cwd} >> ")
+        sys.stdout.write(f"{os.getcwd()} >> ")
         sys.stdout.flush()
         result = run_external_command(sys.stdin.readline().strip())
         if result == "exit":
             break
 
+
 def main():
     shell_loop()
+
 
 if __name__ == "__main__":
     main()
