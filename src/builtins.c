@@ -7,6 +7,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "jobs.h"
 #include "shell.h"
 #include "util.h"
 
@@ -240,6 +241,13 @@ static int builtin_unset(command *cmd)
     return status;
 }
 
+static int builtin_jobs(command *cmd)
+{
+    (void)cmd;
+    jobs_list();
+    return 0;
+}
+
 static const struct {
     const char *name;
     builtin_fn  fn;
@@ -249,6 +257,7 @@ static const struct {
     { "exit",    builtin_exit },
     { "export",  builtin_export },
     { "history", builtin_history },
+    { "jobs",    builtin_jobs },
     { "pwd",     builtin_pwd },
     { "unset",   builtin_unset },
 };

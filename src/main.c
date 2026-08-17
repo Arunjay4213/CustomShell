@@ -1,17 +1,83 @@
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include "builtins.h"
 #include "exec.h"
+#include "jobs.h"
 #include "lexer.h"
 #include "parser.h"
 #include "shell.h"
 #include "util.h"
 
 shell_state shell;
+
+static void handle_sigchld(int sig)
+{
+    (void)sig;
+    jobs_reap();
+}
+
+static void handle_sigint(int sig)
+{
+    /* Nothing to do: the handler exists so that the pending read fails with
+       EINTR and the main loop can start a fresh line. */
+    (void)sig;
+}
+
+static void set_handler(int sig, void (*handler)(int), int flags)
+{
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = flags;
+    if (sigaction(sig, &sa, NULL) != 0) {
+        shell_error("sigaction: %s", strerror(errno));
+    }
+}
+
+/* Puts the shell in its own process group and gives it the terminal, so that
+   every job it starts can own the terminal in turn. */
+static void init_job_control(void)
+{
+    shell.pgid = getpgrp();
+
+    /* Children are reaped in the handler, which keeps finished background jobs
+       from lingering as zombies. SA_RESTART leaves the pending read alone. */
+    set_handler(SIGCHLD, handle_sigchld, SA_RESTART | SA_NOCLDSTOP);
+
+    if (!shell.interactive) {
+        return;
+    }
+
+    /* If the shell was started in the background, stop until a job control
+       aware parent moves it to the foreground. */
+    while (tcgetpgrp(shell.terminal_fd) != (shell.pgid = getpgrp())) {
+        kill(-shell.pgid, SIGTTIN);
+    }
+
+    /* Ctrl-C must cancel the line being typed, not the shell, and the shell
+       must not be stopped or interrupted by its own terminal handling. */
+    set_handler(SIGINT, handle_sigint, 0);
+    set_handler(SIGQUIT, SIG_IGN, 0);
+    set_handler(SIGTSTP, SIG_IGN, 0);
+    set_handler(SIGTTIN, SIG_IGN, 0);
+    set_handler(SIGTTOU, SIG_IGN, 0);
+
+    shell.pgid = getpid();
+    if (setpgid(shell.pgid, shell.pgid) != 0) {
+        shell_error("could not put the shell in its own process group: %s",
+                    strerror(errno));
+        exit(1);
+    }
+    tcsetpgrp(shell.terminal_fd, shell.pgid);
+}
 
 typedef enum {
     READ_OK,
@@ -114,11 +180,13 @@ int main(void)
     shell.last_status = 0;
     shell.terminal_fd = STDIN_FILENO;
     shell.interactive = isatty(shell.terminal_fd);
-    shell.pgid = getpgrp();
+    init_job_control();
 
     while (!shell.should_exit) {
         char *line;
         read_result result;
+
+        jobs_notify();
 
         if (shell.interactive) {
             print_prompt();
@@ -127,6 +195,9 @@ int main(void)
         line = read_line(stdin, &result);
         if (line == NULL) {
             if (result == READ_INTERRUPTED) {
+                /* Ctrl-C: abandon the line and print a fresh prompt. */
+                fputc('\n', stdout);
+                shell.last_status = 128 + SIGINT;
                 continue;
             }
             if (shell.interactive) {
@@ -142,6 +213,7 @@ int main(void)
         free(line);
     }
 
+    jobs_shutdown();
     history_clear();
     return shell.should_exit ? shell.exit_status : shell.last_status;
 }

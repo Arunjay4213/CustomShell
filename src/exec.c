@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +10,7 @@
 #include <unistd.h>
 
 #include "builtins.h"
+#include "jobs.h"
 #include "shell.h"
 #include "util.h"
 
@@ -105,6 +107,32 @@ restore:
     return status;
 }
 
+/* Restores the signal setup a fresh program expects. The shell ignores or
+   catches several signals and may have SIGCHLD blocked, and both the
+   dispositions of caught signals and the blocked mask survive execvp. */
+static void child_reset_signals(void)
+{
+    struct sigaction sa;
+    sigset_t empty;
+    int i;
+    static const int defaults[] = { SIGINT, SIGQUIT, SIGCHLD, SIGTTIN, SIGTTOU };
+
+    memset(&sa, 0, sizeof(sa));
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = SIG_DFL;
+    for (i = 0; i < (int)(sizeof(defaults) / sizeof(defaults[0])); i++) {
+        sigaction(defaults[i], &sa, NULL);
+    }
+
+    /* Stopping a job would leave it stopped for good: there are no fg and bg
+       builtins to resume it, so suspend requests are ignored. */
+    sa.sa_handler = SIG_IGN;
+    sigaction(SIGTSTP, &sa, NULL);
+
+    sigemptyset(&empty);
+    sigprocmask(SIG_SETMASK, &empty, NULL);
+}
+
 /* Runs one stage of a pipeline in the child process. Never returns. */
 static void child_run(command *cmd)
 {
@@ -132,15 +160,19 @@ static void child_run(command *cmd)
 }
 
 /* Forks one child per stage, connecting each stage to the next with a pipe.
-   The number of children actually started is stored in *started so that the
-   caller can reap them even when a later fork fails. */
-static int spawn_pipeline(pipeline *p, pid_t *pids, size_t *started)
+   All stages join one process group, which is what makes a whole pipeline
+   respond to Ctrl-C as a unit. The number of children actually started is
+   stored in *started so that the caller can reap them even when a later fork
+   fails, and the group id in *pgid. */
+static int spawn_pipeline(pipeline *p, pid_t *pids, size_t *started, pid_t *pgid)
 {
     size_t i;
     int prev_read = -1;
     int result = 0;
+    int foreground = !p->background;
 
     *started = 0;
+    *pgid = 0;
 
     for (i = 0; i < p->ncmds; i++) {
         int pipefd[2] = { -1, -1 };
@@ -166,6 +198,16 @@ static int spawn_pipeline(pipeline *p, pid_t *pids, size_t *started)
         }
 
         if (pid == 0) {
+            /* Join the process group of the pipeline. Both the child and the
+               parent do this so neither ordering can lose the race. */
+            setpgid(0, *pgid);
+            /* Claim the terminal while SIGTTOU is still inherited as ignored,
+               so the child cannot be stopped by its own request. */
+            if (foreground && shell.interactive) {
+                tcsetpgrp(shell.terminal_fd, getpgrp());
+            }
+            child_reset_signals();
+
             /* Read end of the previous pipe becomes our stdin. */
             if (prev_read >= 0) {
                 dup2(prev_read, STDIN_FILENO);
@@ -180,6 +222,10 @@ static int spawn_pipeline(pipeline *p, pid_t *pids, size_t *started)
             child_run(&p->cmds[i]);
         }
 
+        if (*pgid == 0) {
+            *pgid = pid; /* the first stage leads the group */
+        }
+        setpgid(pid, *pgid);
         pids[(*started)++] = pid;
 
         /* The parent keeps no pipe ends open, otherwise readers never see
@@ -229,25 +275,21 @@ static int wait_for_pipeline(const pid_t *pids, size_t n)
 
 int exec_pipeline(pipeline *p, const char *cmdline)
 {
+    sigset_t old_mask;
     pid_t *pids;
+    pid_t pgid = 0;
     size_t started = 0;
     int status;
     int failed;
 
-    (void)cmdline;
-
     if (p->ncmds == 0) {
         return shell.last_status;
     }
-    if (p->background) {
-        shell_error("background jobs are not supported yet");
-        return 1;
-    }
 
-    /* A single builtin runs in the shell; inside a pipeline it has to run in a
-       child like everything else, which is why its side effects are lost
-       there. */
-    if (p->ncmds == 1) {
+    /* A single builtin runs in the shell; inside a pipeline or in the
+       background it has to run in a child like everything else, which is why
+       its side effects are lost there. */
+    if (p->ncmds == 1 && !p->background) {
         builtin_fn fn = builtin_lookup(p->cmds[0].argv[0]);
         if (fn != NULL) {
             return run_builtin_in_shell(&p->cmds[0], fn);
@@ -255,9 +297,39 @@ int exec_pipeline(pipeline *p, const char *cmdline)
     }
 
     pids = xmalloc(p->ncmds * sizeof(*pids));
-    failed = spawn_pipeline(p, pids, &started);
-    status = wait_for_pipeline(pids, started);
-    free(pids);
 
-    return failed != 0 ? 1 : status;
+    /* Keep SIGCHLD blocked from the first fork until the job is either
+       registered or fully reaped, so the handler cannot collect a child before
+       we know about it. */
+    jobs_block(&old_mask);
+    failed = spawn_pipeline(p, pids, &started, &pgid);
+
+    if (p->background) {
+        if (started > 0) {
+            int id = jobs_add(pgid, pids, started, cmdline);
+            printf("[%d] %ld\n", id, (long)pgid);
+        } else {
+            free(pids);
+        }
+        status = failed != 0 ? 1 : 0;
+    } else {
+        if (shell.interactive && started > 0) {
+            tcsetpgrp(shell.terminal_fd, pgid);
+        }
+        status = wait_for_pipeline(pids, started);
+        if (shell.interactive) {
+            tcsetpgrp(shell.terminal_fd, shell.pgid);
+            if (status == 128 + SIGINT) {
+                /* Move past the line the terminal echoed for Ctrl-C. */
+                fputc('\n', stdout);
+            }
+        }
+        free(pids);
+        if (failed != 0) {
+            status = 1;
+        }
+    }
+
+    jobs_unblock(&old_mask);
+    return status;
 }
