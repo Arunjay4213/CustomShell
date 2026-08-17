@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include "builtins.h"
+#include "exec.h"
 #include "lexer.h"
 #include "parser.h"
 #include "shell.h"
@@ -98,16 +99,7 @@ static void run_line(const char *line)
     tokens_free(&tokens);
 
     if (pipe_line.ncmds > 0) {
-        command *cmd = &pipe_line.cmds[0];
-        builtin_fn fn = builtin_lookup(cmd->argv[0]);
-
-        if (fn != NULL) {
-            shell.last_status = fn(cmd);
-        } else {
-            /* External commands are not wired up yet. */
-            shell_error("%s: cannot run external commands yet", cmd->argv[0]);
-            shell.last_status = 127;
-        }
+        shell.last_status = exec_pipeline(&pipe_line, line);
     }
 
     pipeline_free(&pipe_line);
@@ -115,6 +107,10 @@ static void run_line(const char *line)
 
 int main(void)
 {
+    /* Line buffering keeps our own output in step with what the children we
+       fork write to the same descriptor. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     shell.last_status = 0;
     shell.terminal_fd = STDIN_FILENO;
     shell.interactive = isatty(shell.terminal_fd);
