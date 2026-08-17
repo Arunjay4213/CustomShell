@@ -1,7 +1,13 @@
-# Ignore the local-only directory
-local_configs/
+# Build output
+build/
+cshell
 
-# Other things to ignore
-__pycache__/
+# Object and dependency files
+*.o
+*.d
+
+# Editor and OS noise
 .idea/
-*.pyc
+.vscode/
+*.swp
+.DS_Store
