@@ -171,15 +171,35 @@ static void run_line(const char *line)
     pipeline_free(&pipe_line);
 }
 
-int main(void)
+static void usage(void)
 {
+    fprintf(stderr, "usage: " SHELL_NAME " [script]\n");
+}
+
+int main(int argc, char **argv)
+{
+    FILE *input = stdin;
+
     /* Line buffering keeps our own output in step with what the children we
        fork write to the same descriptor. */
     setvbuf(stdout, NULL, _IOLBF, 0);
 
+    if (argc > 2) {
+        usage();
+        return 2;
+    }
+    if (argc == 2) {
+        /* Batch mode: read the script instead of the terminal. */
+        input = fopen(argv[1], "r");
+        if (input == NULL) {
+            shell_error("%s: %s", argv[1], strerror(errno));
+            return 1;
+        }
+    }
+
     shell.last_status = 0;
     shell.terminal_fd = STDIN_FILENO;
-    shell.interactive = isatty(shell.terminal_fd);
+    shell.interactive = input == stdin && isatty(shell.terminal_fd);
     init_job_control();
 
     while (!shell.should_exit) {
@@ -192,7 +212,7 @@ int main(void)
             print_prompt();
         }
 
-        line = read_line(stdin, &result);
+        line = read_line(input, &result);
         if (line == NULL) {
             if (result == READ_INTERRUPTED) {
                 /* Ctrl-C: abandon the line and print a fresh prompt. */
@@ -213,6 +233,9 @@ int main(void)
         free(line);
     }
 
+    if (input != stdin) {
+        fclose(input);
+    }
     jobs_shutdown();
     history_clear();
     return shell.should_exit ? shell.exit_status : shell.last_status;
