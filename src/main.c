@@ -70,11 +70,12 @@ static void init_job_control(void)
     set_handler(SIGTTIN, SIG_IGN, 0);
     set_handler(SIGTTOU, SIG_IGN, 0);
 
+    /* A session leader already owns its process group and is not allowed to
+       call setpgid, so only ask for a new group when we are not leading one. */
     shell.pgid = getpid();
-    if (setpgid(shell.pgid, shell.pgid) != 0) {
-        shell_error("could not put the shell in its own process group: %s",
-                    strerror(errno));
-        exit(1);
+    if (getpgrp() != shell.pgid && setpgid(shell.pgid, shell.pgid) != 0) {
+        shell_error("could not create a process group: %s", strerror(errno));
+        shell.pgid = getpgrp();
     }
     tcsetpgrp(shell.terminal_fd, shell.pgid);
 }
